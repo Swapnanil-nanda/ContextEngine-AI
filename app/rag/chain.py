@@ -32,15 +32,30 @@ Engage with the user naturally, like a friendly human colleague.
 Keep your responses concise, helpful, and pleasant.
 If they ask about documents, let them know you are ready to analyze any PDF they upload in the sidebar."""
 
-def get_llm() -> ChatOpenAI | None:
+FALLBACK_FREE_MODELS = [
+    "nvidia/nemotron-3.5-lightning:free",
+    "nvidia/nemotron-3-super-120b-a12b:free",
+    "nvidia/nemotron-3-ultra-550b-a55b:free",
+]
+
+def _candidate_models() -> list[str]:
+    primary = settings.openrouter_model
+    candidates = [primary]
+    for m in FALLBACK_FREE_MODELS:
+        if m not in candidates:
+            candidates.append(m)
+    return candidates
+
+def get_llm(model_name: str | None = None) -> ChatOpenAI | None:
+    target_model = model_name or settings.openrouter_model
     if settings.openrouter_api_key and not settings.openrouter_api_key.startswith("mock"):
         return ChatOpenAI(
             api_key=settings.openrouter_api_key,
             base_url="https://openrouter.ai/api/v1",
-            model=settings.openrouter_model,
+            model=target_model,
             temperature=0.3,
             max_tokens=4096,
-            max_retries=2,
+            max_retries=1,
         )
     if not settings.openai_api_key or settings.openai_api_key.startswith("mock"):
         return None
@@ -49,11 +64,11 @@ def get_llm() -> ChatOpenAI | None:
         model=settings.llm_model,
         temperature=0.3,
         max_tokens=4096,
-        max_retries=2,
+        max_retries=1,
     )
 
-def build_chain():
-    llm = get_llm()
+def build_chain(model_name: str | None = None):
+    llm = get_llm(model_name=model_name)
     if llm is None:
         return None
     prompt = ChatPromptTemplate.from_messages([
@@ -63,8 +78,8 @@ def build_chain():
     ])
     return prompt | llm | StrOutputParser()
 
-def build_chitchat_chain():
-    llm = get_llm()
+def build_chitchat_chain(model_name: str | None = None):
+    llm = get_llm(model_name=model_name)
     if llm is None:
         return None
     prompt = ChatPromptTemplate.from_messages([
@@ -138,63 +153,78 @@ def _fallback_answer(question: str, documents: Sequence[Document]) -> str:
 async def generate_response(
     question: str, context_docs: Sequence[Document], history: Sequence[ChatMessage] | None = None
 ) -> str:
-    if _is_chitchat_query(question) or not context_docs:
-        chain = build_chitchat_chain()
-        if chain is None:
-            return _fallback_chitchat(question)
-        try:
-            return await chain.ainvoke({
-                "history": _history(history), "question": question
-            })
-        except Exception:
-            logger.exception("Chitchat answer generation failed; returning conversational fallback")
-            return _fallback_chitchat(question)
+    models = _candidate_models() if (settings.openrouter_api_key and not settings.openrouter_api_key.startswith("mock")) else [None]
 
-    chain = build_chain()
-    if chain is None:
-        return _fallback_answer(question, context_docs)
-    try:
-        raw_ans = await chain.ainvoke({
-            "context": _context(context_docs), "history": _history(history), "question": question
-        })
-        verifier = VerificationAgent()
-        verification = verifier.verify_groundedness(raw_ans, context_docs)
-        if verification["hallucination_risk"] == "HIGH":
-            logger.warning(f"Answer failed verification (confidence {verification['confidence_score']}%)")
-        return raw_ans
-    except Exception:
-        logger.exception("Answer generation failed; returning extractive fallback")
-        return _fallback_answer(question, context_docs)
+    if _is_chitchat_query(question) or not context_docs:
+        for m in models:
+            chain = build_chitchat_chain(model_name=m)
+            if chain is None:
+                continue
+            try:
+                return await chain.ainvoke({
+                    "history": _history(history), "question": question
+                })
+            except Exception as e:
+                logger.warning("Chitchat generation failed with model %s: %s", m, e)
+                continue
+        return _fallback_chitchat(question)
+
+    for m in models:
+        chain = build_chain(model_name=m)
+        if chain is None:
+            continue
+        try:
+            raw_ans = await chain.ainvoke({
+                "context": _context(context_docs), "history": _history(history), "question": question
+            })
+            verifier = VerificationAgent()
+            verification = verifier.verify_groundedness(raw_ans, context_docs)
+            if verification["hallucination_risk"] == "HIGH":
+                logger.warning(f"Answer failed verification (confidence {verification['confidence_score']}%)")
+            return raw_ans
+        except Exception as e:
+            logger.warning("Answer generation failed with model %s: %s", m, e)
+            continue
+
+    logger.warning("All models failed; returning extractive fallback")
+    return _fallback_answer(question, context_docs)
 
 async def generate_stream(
     question: str, context_docs: Sequence[Document], history: Sequence[ChatMessage] | None = None
 ) -> AsyncGenerator[str, None]:
+    models = _candidate_models() if (settings.openrouter_api_key and not settings.openrouter_api_key.startswith("mock")) else [None]
+
     if _is_chitchat_query(question) or not context_docs:
-        chain = build_chitchat_chain()
-        if chain is not None:
-            try:
-                async for chunk in chain.astream({
-                    "history": _history(history), "question": question
-                }):
-                    yield chunk
-                return
-            except Exception:
-                logger.exception("Chitchat streaming failed; returning conversational fallback")
+        for m in models:
+            chain = build_chitchat_chain(model_name=m)
+            if chain is not None:
+                try:
+                    async for chunk in chain.astream({
+                        "history": _history(history), "question": question
+                    }):
+                        yield chunk
+                    return
+                except Exception as e:
+                    logger.warning("Chitchat streaming failed with model %s: %s", m, e)
+                    continue
         for token in _fallback_chitchat(question).split(" "):
             yield f"{token} "
             await asyncio.sleep(0)
         return
 
-    chain = build_chain()
-    if chain is not None:
-        try:
-            async for chunk in chain.astream({
-                "context": _context(context_docs), "history": _history(history), "question": question
-            }):
-                yield chunk
-            return
-        except Exception:
-            logger.exception("Answer streaming failed; returning extractive fallback")
+    for m in models:
+        chain = build_chain(model_name=m)
+        if chain is not None:
+            try:
+                async for chunk in chain.astream({
+                    "context": _context(context_docs), "history": _history(history), "question": question
+                }):
+                    yield chunk
+                return
+            except Exception as e:
+                logger.warning("Streaming failed with model %s: %s", m, e)
+                continue
+
     for token in _fallback_answer(question, context_docs).split(" "):
         yield f"{token} "
         await asyncio.sleep(0)
