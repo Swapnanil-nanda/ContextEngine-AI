@@ -29,3 +29,5 @@ app/static/media/*
 
 rag_agent_project.zip
 
+*.docx
+generate_resume_docx.py
